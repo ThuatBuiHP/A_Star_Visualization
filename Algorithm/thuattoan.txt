@@ -1,0 +1,19 @@
+Bạn đang yêu cầu như sau:
+
+Có một tập hợp các node. Mỗi node có tọa độ và bán kính phủ sóng riêng.
+
+Dùng vòng lặp để tính khoảng cách giữa các node. Nếu khoảng cách nhỏ hơn hoặc bằng bán kính phủ sóng thì hai node được coi là nối với nhau. Từ đó xây dựng được đồ thị kết nối.
+
+Khi tất cả node hoạt động bình thường, ta chọn đường đi tối ưu (theo khoảng cách ngắn nhất hoặc chi phí nhỏ nhất).
+
+Khi một node bị lỗi:
+
+Bắt đầu từ node bị lỗi, loại bỏ nó ra khỏi mạng.
+
+Tìm một node khác (còn sống, nằm trong vùng phủ sóng lân cận).
+
+Xác định lại đường đi thay thế tối ưu để duy trì kết nối toàn mạng.
+
+Nói ngắn gọn: Xây dựng đồ thị kết nối giữa các node dựa vào khoảng cách và bán kính phủ sóng. Sau đó, khi xảy ra lỗi ở một node, cần có thuật toán tìm đường đi khác tối ưu từ vị trí bị lỗi đến đích thông qua các node còn hoạt động.
+
+- đo thời gian thực với các testcase
