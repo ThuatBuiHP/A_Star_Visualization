@@ -1,8 +1,7 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import type { LineString } from 'geojson'
 
 type SelectionMode = 'start' | 'end'
 
@@ -11,10 +10,28 @@ interface LatLngPoint {
   lon: number
 }
 
-interface RouteSummary {
-  distance: number
-  duration: number
-  geometry: LineString
+interface GridMeta {
+  rows: number
+  cols: number
+  latMin: number
+  latMax: number
+  lonMin: number
+  lonMax: number
+  latStep: number
+  lonStep: number
+}
+
+interface GridCell extends LatLngPoint {
+  row: number
+  col: number
+  walkable: boolean
+}
+
+interface BuiltGrid {
+  meta: GridMeta
+  cells: GridCell[][]
+  blockedRatio: number
+  cellLookup: Map<string, GridCell>
 }
 
 interface AStarFrame {
@@ -24,7 +41,33 @@ interface AStarFrame {
   g: number
   h: number
   f: number
+  openSize: number
+  closedSize: number
 }
+
+interface SearchResult {
+  path: LatLngPoint[]
+  frames: AStarFrame[]
+  gridMeta: GridMeta
+  blockedRatio: number
+  pathDistance: number
+  expanded: number
+  generated: number
+}
+
+interface SearchRecord extends GridCell {
+  g: number
+  h: number
+  f: number
+  key: string
+}
+
+const GRID_ROWS = 34
+const GRID_COLS = 34
+const PADDING_FACTOR = 0.4
+const BLOCK_THRESHOLD = 0.72
+const MIN_SPAN = 0.012
+const MAX_EXPLORATION_MARKERS = 220
 
 const mapContainer = ref<HTMLDivElement | null>(null)
 const map = ref<L.Map | null>(null)
@@ -33,25 +76,23 @@ const endPoint = ref<LatLngPoint | null>(null)
 const activeSelection = ref<SelectionMode>('start')
 const loading = ref(false)
 const error = ref('')
-const routeSummary = ref<RouteSummary | null>(null)
-const frames = ref<AStarFrame[]>([])
-const currentFrameIndex = ref(0)
-const followExplorer = ref(true)
+const searchResult = ref<SearchResult | null>(null)
 
-const routeLayer = ref<L.GeoJSON | null>(null)
-const explorationMarker = ref<L.CircleMarker | null>(null)
 const startMarker = ref<L.Marker | null>(null)
 const endMarker = ref<L.Marker | null>(null)
-let requestToken = 0
+const pathLayer = ref<L.Polyline | null>(null)
+const explorationLayer = ref<L.LayerGroup | null>(null)
+const blockedLayer = ref<L.LayerGroup | null>(null)
 
+const recentFrames = computed(() =>
+  searchResult.value ? searchResult.value.frames.slice(-12).reverse() : [],
+)
+const pathRows = computed(() => searchResult.value?.path ?? [])
+const formattedStart = computed(() => formatPoint(startPoint.value))
+const formattedEnd = computed(() => formatPoint(endPoint.value))
 const hasBothPoints = computed(() => Boolean(startPoint.value && endPoint.value))
-const currentFrame = computed(() => frames.value[currentFrameIndex.value] ?? null)
-const closedNodes = computed(() =>
-  frames.value.slice(0, currentFrameIndex.value + 1).slice(-6).reverse(),
-)
-const openNodes = computed(() =>
-  frames.value.slice(currentFrameIndex.value + 1, currentFrameIndex.value + 6),
-)
+
+let searchToken = 0
 
 onMounted(() => {
   if (!mapContainer.value) return
@@ -78,21 +119,11 @@ onBeforeUnmount(() => {
 
 watch([startPoint, endPoint], ([start, end]) => {
   if (start && end) {
-    fetchRoute()
+    runSearch()
   } else {
-    cleanupRoute()
+    cancelSearch()
   }
 })
-
-watch(currentFrameIndex, () => updateExplorationMarker())
-
-watch(
-  () => frames.value.length,
-  () => {
-    currentFrameIndex.value = 0
-    updateExplorationMarker()
-  },
-)
 
 function handleMapClick(event: L.LeafletMouseEvent) {
   const { lat, lng } = event.latlng
@@ -137,75 +168,392 @@ function placeMarker(
   }
 }
 
-async function fetchRoute() {
+async function runSearch() {
   const start = startPoint.value
   const end = endPoint.value
   if (!start || !end) return
-  const token = ++requestToken
+
+  const token = ++searchToken
   loading.value = true
   error.value = ''
 
-  const { lat: startLat, lon: startLon } = start
-  const { lat: endLat, lon: endLon } = end
-  const query =
-    `https://router.project-osrm.org/route/v1/driving/` +
-    `${startLon},${startLat};${endLon},${endLat}` +
-    `?overview=full&geometries=geojson&steps=true`
+  await nextTick()
 
   try {
-    const response = await fetch(query)
-    if (!response.ok) {
-      throw new Error('Không thể kết nối OSRM')
-    }
-    const payload = await response.json()
-    const route = payload?.routes?.[0]
-    if (!route || token !== requestToken) return
+    const builtGrid = buildGrid(start, end)
+    const startCell = locateCell(start, builtGrid)
+    const goalCell = locateCell(end, builtGrid)
+    startCell.walkable = true
+    goalCell.walkable = true
 
-    routeSummary.value = {
-      distance: route.distance,
-      duration: route.duration,
-      geometry: route.geometry,
+    const result = runAStarOnGrid(builtGrid, startCell, goalCell)
+
+    if (token !== searchToken) return
+
+    drawBlockedCells(builtGrid)
+
+    if (!result.path.length) {
+      searchResult.value = null
+      drawPathOnMap([])
+      drawExplorationMarkers([])
+      focusOnGrid(builtGrid.meta)
+      error.value = 'Không tìm thấy đường đi vì chướng ngại quá dày ở vùng này.'
+      return
     }
 
-    drawRoute(route.geometry)
-    frames.value = createFrames(route.geometry.coordinates, end)
-    focusOnRoute()
+    searchResult.value = result
+    drawPathOnMap(result.path)
+    drawExplorationMarkers(result.frames)
+    focusOnPath(result.path)
   } catch (err) {
     console.error(err)
-    error.value =
-      err instanceof Error ? err.message : 'Đã có lỗi khi tìm đường, thử lại sau nhé.'
-    cleanupRoute()
+    if (token !== searchToken) return
+    searchResult.value = null
+    drawPathOnMap([])
+    drawExplorationMarkers([])
+    error.value = err instanceof Error ? err.message : 'Đã có lỗi trong lúc chạy A*.'
   } finally {
-    if (token === requestToken) {
+    if (token === searchToken) {
       loading.value = false
     }
   }
 }
 
-function createFrames(coords: LineString['coordinates'], goal: LatLngPoint): AStarFrame[] {
-  let g = 0
-  const framesList: AStarFrame[] = []
+function cancelSearch() {
+  searchToken += 1
+  loading.value = false
+  searchResult.value = null
+  error.value = ''
+  drawPathOnMap([])
+  drawExplorationMarkers([])
+  clearBlockedLayer()
+}
 
-  for (let i = 0; i < coords.length; i += 1) {
-    const node = coords[i]
-    if (!node) continue
-    const [lon, lat] = node as [number, number]
-    if (i > 0) {
-      const previous = coords[i - 1] as [number, number]
-      g += haversine(previous[1], previous[0], lat, lon)
-    }
-    const h = haversine(lat, lon, goal.lat, goal.lon)
-    framesList.push({
-      index: i,
-      lat,
-      lon,
-      g,
-      h,
-      f: g + h,
+function drawPathOnMap(points: LatLngPoint[]) {
+  const currentMap = map.value as L.Map | null
+  pathLayer.value?.remove()
+  pathLayer.value = null
+  if (!currentMap || !points.length) return
+
+  const latLngs = points.map((p) => [p.lat, p.lon] as L.LatLngTuple)
+  pathLayer.value = L.polyline(latLngs, {
+    color: '#38bdf8',
+    weight: 5,
+    opacity: 0.9,
+  }).addTo(currentMap)
+}
+
+function drawExplorationMarkers(frames: AStarFrame[]) {
+  const currentMap = map.value as L.Map | null
+  explorationLayer.value?.remove()
+  explorationLayer.value = null
+  if (!currentMap || !frames.length) return
+
+  const step = Math.max(1, Math.floor(frames.length / MAX_EXPLORATION_MARKERS))
+  const group = L.layerGroup()
+  for (let i = 0; i < frames.length; i += step) {
+    const frame = frames[i]
+    if (!frame) continue
+    const marker = L.circleMarker([frame.lat, frame.lon], {
+      radius: 5,
+      weight: 1,
+      color: '#f97316',
+      fillColor: '#fdba74',
+      fillOpacity: 0.9,
     })
+    group.addLayer(marker)
+  }
+  group.addTo(currentMap)
+  explorationLayer.value = group
+}
+
+function drawBlockedCells(grid: BuiltGrid) {
+  const currentMap = map.value as L.Map | null
+  clearBlockedLayer()
+  if (!currentMap) return
+
+  const group = L.layerGroup()
+  for (const row of grid.cells) {
+    for (const cell of row) {
+      if (cell.walkable) continue
+      const south = grid.meta.latMin + cell.row * grid.meta.latStep
+      const north = south + grid.meta.latStep
+      const west = grid.meta.lonMin + cell.col * grid.meta.lonStep
+      const east = west + grid.meta.lonStep
+      const rect = L.rectangle(
+        [
+          [south, west],
+          [north, east],
+        ],
+        {
+          color: '#f87171',
+          weight: 0,
+          fillColor: '#ef4444',
+          fillOpacity: 0.22,
+          className: 'blocked-cell',
+        },
+      )
+      group.addLayer(rect)
+    }
+  }
+  group.addTo(currentMap)
+  blockedLayer.value = group
+}
+
+function clearBlockedLayer() {
+  blockedLayer.value?.remove()
+  blockedLayer.value = null
+}
+
+function focusOnPath(points: LatLngPoint[]) {
+  const currentMap = map.value as L.Map | null
+  if (!currentMap || !points.length) return
+  const bounds = L.latLngBounds(
+    points.map((p) => [p.lat, p.lon] as L.LatLngTuple),
+  )
+  currentMap.fitBounds(bounds, { padding: [24, 24] })
+}
+
+function focusOnGrid(meta: GridMeta) {
+  const currentMap = map.value as L.Map | null
+  if (!currentMap) return
+  const bounds = L.latLngBounds(
+    [meta.latMin, meta.lonMin],
+    [meta.latMax, meta.lonMax],
+  )
+  currentMap.fitBounds(bounds, { padding: [24, 24] })
+}
+
+function resetAll() {
+  startPoint.value = null
+  endPoint.value = null
+  activeSelection.value = 'start'
+  searchResult.value = null
+  error.value = ''
+  startMarker.value?.remove()
+  startMarker.value = null
+  endMarker.value?.remove()
+  endMarker.value = null
+  drawPathOnMap([])
+  drawExplorationMarkers([])
+  clearBlockedLayer()
+}
+
+function swapPoints() {
+  if (!startPoint.value || !endPoint.value) return
+  const oldStart = { ...startPoint.value }
+  startPoint.value = { ...endPoint.value }
+  endPoint.value = oldStart
+  placeMarker(startMarker, startPoint.value, '#16a34a', 'S')
+  placeMarker(endMarker, endPoint.value, '#dc2626', 'G')
+}
+
+function buildGrid(start: LatLngPoint, end: LatLngPoint): BuiltGrid {
+  const latSpan = Math.max(Math.abs(end.lat - start.lat), MIN_SPAN)
+  const lonSpan = Math.max(Math.abs(end.lon - start.lon), MIN_SPAN)
+  const latMin = Math.min(start.lat, end.lat) - latSpan * PADDING_FACTOR
+  const latMax = Math.max(start.lat, end.lat) + latSpan * PADDING_FACTOR
+  const lonMin = Math.min(start.lon, end.lon) - lonSpan * PADDING_FACTOR
+  const lonMax = Math.max(start.lon, end.lon) + lonSpan * PADDING_FACTOR
+
+  const meta: GridMeta = {
+    rows: GRID_ROWS,
+    cols: GRID_COLS,
+    latMin,
+    latMax,
+    lonMin,
+    lonMax,
+    latStep: (latMax - latMin) / GRID_ROWS,
+    lonStep: (lonMax - lonMin) / GRID_COLS,
   }
 
-  return framesList
+  const cells: GridCell[][] = []
+  const lookup = new Map<string, GridCell>()
+  let blocked = 0
+
+  for (let row = 0; row < GRID_ROWS; row += 1) {
+    const rowCells: GridCell[] = []
+    for (let col = 0; col < GRID_COLS; col += 1) {
+      const lat = latMin + (row + 0.5) * meta.latStep
+      const lon = lonMin + (col + 0.5) * meta.lonStep
+      const noise = pseudoNoise(lat, lon)
+      const walkable = noise > BLOCK_THRESHOLD ? false : true
+      if (!walkable) blocked += 1
+      const cell: GridCell = { row, col, lat, lon, walkable }
+      rowCells.push(cell)
+      lookup.set(cellKey(row, col), cell)
+    }
+    cells.push(rowCells)
+  }
+
+  return {
+    meta,
+    cells,
+    blockedRatio: blocked / (GRID_ROWS * GRID_COLS),
+    cellLookup: lookup,
+  }
+}
+
+function locateCell(point: LatLngPoint, grid: BuiltGrid): GridCell {
+  const row = clamp(
+    Math.floor(((point.lat - grid.meta.latMin) / (grid.meta.latMax - grid.meta.latMin)) * grid.meta.rows),
+    0,
+    grid.meta.rows - 1,
+  )
+  const col = clamp(
+    Math.floor(((point.lon - grid.meta.lonMin) / (grid.meta.lonMax - grid.meta.lonMin)) * grid.meta.cols),
+    0,
+    grid.meta.cols - 1,
+  )
+  const fallback = grid.cells[0]?.[0]
+  if (!fallback) {
+    throw new Error('Lưới chưa sẵn sàng.')
+  }
+  return grid.cells[row]?.[col] ?? fallback
+}
+
+function runAStarOnGrid(grid: BuiltGrid, startCell: GridCell, goalCell: GridCell): SearchResult {
+  const startKey = cellKey(startCell.row, startCell.col)
+  const goalKey = cellKey(goalCell.row, goalCell.col)
+  const openHeap = new MinHeap<SearchRecord>((a, b) => a.f - b.f)
+  const bestG = new Map<string, number>()
+  const parents = new Map<string, string | null>()
+  const openTracker = new Map<string, SearchRecord>()
+  const closedSet = new Set<string>()
+  const frames: AStarFrame[] = []
+  let generated = 0
+
+  const hStart = haversine(startCell.lat, startCell.lon, goalCell.lat, goalCell.lon)
+  const startRecord: SearchRecord = { ...startCell, g: 0, h: hStart, f: hStart, key: startKey }
+  openHeap.push(startRecord)
+  openTracker.set(startKey, startRecord)
+  bestG.set(startKey, 0)
+  parents.set(startKey, null)
+
+  while (openHeap.size() > 0) {
+    const current = openHeap.pop()
+    if (!current) break
+    const known = bestG.get(current.key)
+    if (known === undefined || current.g > known) {
+      continue
+    }
+    openTracker.delete(current.key)
+
+    frames.push({
+      index: frames.length,
+      lat: current.lat,
+      lon: current.lon,
+      g: current.g,
+      h: current.h,
+      f: current.f,
+      openSize: openTracker.size,
+      closedSize: frames.length + 1,
+    })
+
+    if (current.key === goalKey) {
+      const path = buildPath(current.key, parents, grid.cellLookup)
+      return {
+        path,
+        frames,
+        gridMeta: grid.meta,
+        blockedRatio: grid.blockedRatio,
+        pathDistance: computePathDistance(path),
+        expanded: frames.length,
+        generated,
+      }
+    }
+
+    closedSet.add(current.key)
+
+    for (const neighbor of findNeighbors(current, grid)) {
+      const neighborKey = cellKey(neighbor.row, neighbor.col)
+      if (closedSet.has(neighborKey) || !neighbor.walkable) continue
+
+      const tentativeG = current.g + haversine(current.lat, current.lon, neighbor.lat, neighbor.lon)
+      const bestNeighbor = bestG.get(neighborKey)
+      if (bestNeighbor !== undefined && tentativeG >= bestNeighbor) {
+        continue
+      }
+
+      const h = haversine(neighbor.lat, neighbor.lon, goalCell.lat, goalCell.lon)
+      const record: SearchRecord = {
+        ...neighbor,
+        g: tentativeG,
+        h,
+        f: tentativeG + h,
+        key: neighborKey,
+      }
+
+      bestG.set(neighborKey, tentativeG)
+      parents.set(neighborKey, current.key)
+      openTracker.set(neighborKey, record)
+      openHeap.push(record)
+      generated += 1
+    }
+  }
+
+  return {
+    path: [],
+    frames,
+    gridMeta: grid.meta,
+    blockedRatio: grid.blockedRatio,
+    pathDistance: 0,
+    expanded: frames.length,
+    generated,
+  }
+}
+
+function findNeighbors(cell: GridCell, grid: BuiltGrid) {
+  const neighbors: GridCell[] = []
+  for (const [dr, dc] of neighborOffsets) {
+    const nr = cell.row + dr
+    const nc = cell.col + dc
+    if (nr < 0 || nr >= grid.meta.rows || nc < 0 || nc >= grid.meta.cols) continue
+    const rowCells = grid.cells[nr]
+    if (!rowCells) continue
+    const neighbor = rowCells[nc]
+    if (!neighbor) continue
+    neighbors.push(neighbor)
+  }
+  return neighbors
+}
+
+const neighborOffsets: Array<[number, number]> = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1],
+  [1, 1],
+  [1, -1],
+  [-1, 1],
+  [-1, -1],
+]
+
+function buildPath(key: string, parents: Map<string, string | null>, lookup: Map<string, GridCell>) {
+  const path: LatLngPoint[] = []
+  let currentKey: string | null | undefined = key
+  while (currentKey) {
+    const cell = lookup.get(currentKey)
+    if (!cell) break
+    path.push({ lat: cell.lat, lon: cell.lon })
+    currentKey = parents.get(currentKey) ?? null
+  }
+  return path.reverse()
+}
+
+function computePathDistance(points: LatLngPoint[]) {
+  let total = 0
+  for (let i = 1; i < points.length; i += 1) {
+    const prev = points[i - 1]
+    const curr = points[i]
+    if (!prev || !curr) continue
+    total += haversine(prev.lat, prev.lon, curr.lat, curr.lon)
+  }
+  return total
+}
+
+function cellKey(row: number, col: number) {
+  return `${row}:${col}`
 }
 
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
@@ -220,95 +568,14 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   return R * c
 }
 
-function drawRoute(geometry: LineString) {
-  const currentMap = map.value
-  if (!currentMap) return
-  const mapInstance = currentMap as L.Map
-  removeRouteLayer()
-  routeLayer.value = L.geoJSON(geometry, {
-    style: {
-      color: '#2563eb',
-      weight: 5,
-      opacity: 0.85,
-    },
-  }).addTo(mapInstance)
+function pseudoNoise(lat: number, lon: number) {
+  const raw = Math.sin(lat * 21.9898 + lon * 47.233 + lat * lon * 11.73) * 43758.5453
+  return raw - Math.floor(raw)
 }
 
-function focusOnRoute() {
-  const currentMap = map.value
-  if (!currentMap || !routeLayer.value) return
-  const mapInstance = currentMap as L.Map
-  const bounds = routeLayer.value.getBounds()
-  mapInstance.fitBounds(bounds, { padding: [24, 24] })
-  updateExplorationMarker()
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
 }
-
-function updateExplorationMarker() {
-  const currentMap = map.value
-  if (!currentMap) return
-  const mapInstance = currentMap as L.Map
-  const frame = currentFrame.value
-  if (!frame) {
-    explorationMarker.value?.remove()
-    explorationMarker.value = null
-    return
-  }
-
-  const latLng: L.LatLngTuple = [frame.lat, frame.lon]
-  if (explorationMarker.value) {
-    explorationMarker.value.setLatLng(latLng)
-  } else {
-    explorationMarker.value = L.circleMarker(latLng, {
-      radius: 8,
-      weight: 2,
-      color: '#f59e0b',
-      fillColor: '#fcd34d',
-      fillOpacity: 0.9,
-    }).addTo(mapInstance)
-  }
-
-  if (followExplorer.value) {
-    mapInstance.panTo(latLng, { animate: true, duration: 0.4 })
-  }
-}
-
-function cleanupRoute() {
-  routeSummary.value = null
-  frames.value = []
-  removeRouteLayer()
-}
-
-function removeRouteLayer() {
-  routeLayer.value?.remove()
-  routeLayer.value = null
-  explorationMarker.value?.remove()
-  explorationMarker.value = null
-}
-
-function resetAll() {
-  startPoint.value = null
-  endPoint.value = null
-  activeSelection.value = 'start'
-  cleanupRoute()
-  startMarker.value?.remove()
-  startMarker.value = null
-  endMarker.value?.remove()
-  endMarker.value = null
-}
-
-function swapPoints() {
-  if (!startPoint.value || !endPoint.value) return
-  const oldStart = { ...startPoint.value }
-  startPoint.value = { ...endPoint.value }
-  endPoint.value = oldStart
-  placeMarker(startMarker, startPoint.value, '#16a34a', 'S')
-  placeMarker(endMarker, endPoint.value, '#dc2626', 'G')
-}
-
-const canSwap = computed(() => Boolean(startPoint.value && endPoint.value))
-
-const formattedStart = computed(() => formatPoint(startPoint.value))
-const formattedEnd = computed(() => formatPoint(endPoint.value))
 
 function formatPoint(point: LatLngPoint | null) {
   if (!point) return '--'
@@ -322,14 +589,86 @@ function formatDistance(distance: number) {
   return `${distance.toFixed(0)} m`
 }
 
-function formatDuration(durationSeconds: number) {
-  const minutes = Math.round(durationSeconds / 60)
-  if (minutes < 60) {
-    return `${minutes} phút`
+class MinHeap<T> {
+  private heap: T[] = []
+
+  constructor(private comparator: (a: T, b: T) => number) {}
+
+  push(value: T) {
+    this.heap.push(value)
+    this.bubbleUp(this.heap.length - 1)
   }
-  const hours = Math.floor(minutes / 60)
-  const rest = minutes % 60
-  return `${hours} giờ ${rest} phút`
+
+  pop() {
+    if (this.heap.length === 0) return undefined
+    const top = this.heap[0]!
+    const end = this.heap.pop()
+    if (this.heap.length > 0 && end !== undefined) {
+      this.heap[0] = end
+      this.bubbleDown(0)
+    }
+    return top
+  }
+
+  size() {
+    return this.heap.length
+  }
+
+  private bubbleUp(index: number) {
+    let idx = index
+    while (idx > 0) {
+      const parentIdx = Math.floor((idx - 1) / 2)
+      const parent = this.heap[parentIdx]
+      const current = this.heap[idx]
+      if (parent === undefined || current === undefined) break
+      if (this.comparator(current, parent) >= 0) break
+      this.swap(idx, parentIdx)
+      idx = parentIdx
+    }
+  }
+
+  private bubbleDown(index: number) {
+    let idx = index
+    const length = this.heap.length
+    while (true) {
+      const left = idx * 2 + 1
+      const right = left + 1
+      let smallest = idx
+
+      const leftValue = this.heap[left]
+      const smallestValue = this.heap[smallest]
+      if (
+        left < length &&
+        leftValue !== undefined &&
+        smallestValue !== undefined &&
+        this.comparator(leftValue, smallestValue) < 0
+      ) {
+        smallest = left
+      }
+      const rightValue = this.heap[right]
+      const currentSmallest = this.heap[smallest]
+      if (
+        right < length &&
+        rightValue !== undefined &&
+        currentSmallest !== undefined &&
+        this.comparator(rightValue, currentSmallest) < 0
+      ) {
+        smallest = right
+      }
+      if (smallest === idx) break
+      this.swap(idx, smallest)
+      idx = smallest
+    }
+  }
+
+  private swap(i: number, j: number) {
+    if (i === j) return
+    const first = this.heap[i]
+    const second = this.heap[j]
+    if (first === undefined || second === undefined) return
+    this.heap[i] = second
+    this.heap[j] = first
+  }
 }
 </script>
 
@@ -337,15 +676,15 @@ function formatDuration(durationSeconds: number) {
   <div class="app-shell">
     <header class="hero">
       <div>
-        <p class="kicker">A* demo • OSRM</p>
-        <h1>Visualization tìm đường theo phong cách Google Maps</h1>
+        <p class="kicker">A* sandbox</p>
+        <h1>Biểu diễn đường đi bằng thuật toán A*</h1>
         <p class="subtitle">
-          Chọn 2 điểm bất kỳ trên nền bản đồ OSM, hệ thống sẽ gọi OSRM và tái hiện lại logic
-          A* thông qua các node trên đường đi.
+          Chọn hai điểm trên bản đồ, hệ thống sẽ dựng một lưới chướng ngại giả lập và chạy A*
+          (heuristic = haversine) ngay trong trình duyệt để nối chúng lại.
         </p>
       </div>
       <div class="hero-actions">
-        <button class="ghost" @click="swapPoints" :disabled="!canSwap">Đổi vị trí</button>
+        <button class="ghost" @click="swapPoints" :disabled="!hasBothPoints">Đổi vị trí</button>
         <button class="ghost" @click="resetAll">Làm mới</button>
       </div>
     </header>
@@ -384,123 +723,111 @@ function formatDuration(durationSeconds: number) {
           </div>
         </div>
         <div ref="mapContainer" class="map-container"></div>
+        <p class="map-hint">
+          Ô màu đỏ = chướng ngại. Vệt cam thể hiện các node đã được mở rộng trong quá trình chạy
+          A*.
+        </p>
       </section>
 
       <section class="details-panel">
-        <h2>Trạng thái A*</h2>
+        <h2>Diễn tiến tìm đường</h2>
         <p class="hint">
-          OSRM trả về 1 đường đi. Ta xem mỗi điểm của polyline này như node mà A* mở rộng.
-          Slider phía dưới mô phỏng thứ tự duyệt và giá trị \(f = g + h\).
+          Lưới ({{ GRID_ROWS }}×{{ GRID_COLS }}) được tạo theo bounding box của hai điểm. Ta dùng
+          heuristic nhất quán nên A* luôn tìm ra đường tối ưu nếu tồn tại.
         </p>
 
         <div v-if="error" class="state error">{{ error }}</div>
-        <div v-else-if="loading" class="state">Đang tìm đường với OSRM...</div>
+        <div v-else-if="loading" class="state">Đang dựng lưới và chạy A*...</div>
         <template v-else>
-          <div v-if="routeSummary" class="summary">
+          <div v-if="searchResult" class="summary">
             <div class="summary-grid">
               <div>
-                <p class="label">Quãng đường</p>
-                <strong>{{ formatDistance(routeSummary.distance) }}</strong>
+                <p class="label">Độ dài đường đi</p>
+                <strong>{{ formatDistance(searchResult.pathDistance) }}</strong>
               </div>
               <div>
-                <p class="label">Thời gian ước lượng</p>
-                <strong>{{ formatDuration(routeSummary.duration) }}</strong>
+                <p class="label">Số bước trên đường đi</p>
+                <strong>{{ pathRows.length }}</strong>
               </div>
-              <div class="follow-toggle">
-                <label>
-                  <input type="checkbox" v-model="followExplorer" />
-                  Theo sát node đang xét
-                </label>
+              <div>
+                <p class="label">Node đã mở rộng</p>
+                <strong>{{ searchResult.expanded }}</strong>
+              </div>
+              <div>
+                <p class="label">Node đã sinh</p>
+                <strong>{{ searchResult.generated }}</strong>
+              </div>
+              <div>
+                <p class="label">Kích thước lưới</p>
+                <strong>{{ searchResult.gridMeta.rows }} × {{ searchResult.gridMeta.cols }}</strong>
+              </div>
+              <div>
+                <p class="label">Tỉ lệ chướng ngại</p>
+                <strong>{{ (searchResult.blockedRatio * 100).toFixed(1) }}%</strong>
               </div>
             </div>
 
-            <div v-if="frames.length" class="slider">
-              <input
-                type="range"
-                :max="frames.length - 1"
-                min="0"
-                v-model.number="currentFrameIndex"
-              />
-              <p class="label">
-                Node #{{ currentFrame?.index ?? 0 }} • g={{ currentFrame?.g.toFixed(0) }}m •
-                h={{ currentFrame?.h.toFixed(0) }}m
-              </p>
-            </div>
-
-            <div v-if="currentFrame" class="frame-card">
-              <p class="coord">
-                {{ currentFrame.lat.toFixed(5) }}, {{ currentFrame.lon.toFixed(5) }}
-              </p>
-              <div class="metrics">
-                <div>
-                  <span>g (đi được)</span>
-                  <strong>{{ formatDistance(currentFrame.g) }}</strong>
-                </div>
-                <div>
-                  <span>h (ước lượng)</span>
-                  <strong>{{ formatDistance(currentFrame.h) }}</strong>
-                </div>
-                <div>
-                  <span>f</span>
-                  <strong>{{ formatDistance(currentFrame.f) }}</strong>
-                </div>
-              </div>
-            </div>
-
-            <div class="table-wrapper" v-if="frames.length">
+            <div class="table-wrapper">
               <div>
-                <h3>Closed set gần nhất</h3>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Lat</th>
-                      <th>Lon</th>
-                      <th>f</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="node in closedNodes" :key="`closed-${node.index}`">
-                      <td>{{ node.index }}</td>
-                      <td>{{ node.lat.toFixed(4) }}</td>
-                      <td>{{ node.lon.toFixed(4) }}</td>
-                      <td>{{ formatDistance(node.f) }}</td>
-                    </tr>
-                  </tbody>
-                </table>
+                <h3>Nhật ký mở rộng (mới nhất)</h3>
+                <div class="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Lat</th>
+                        <th>Lon</th>
+                        <th>g</th>
+                        <th>h</th>
+                        <th>f</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="frame in recentFrames" :key="`frame-${frame.index}`">
+                        <td>{{ frame.index }}</td>
+                        <td>{{ frame.lat.toFixed(4) }}</td>
+                        <td>{{ frame.lon.toFixed(4) }}</td>
+                        <td>{{ formatDistance(frame.g) }}</td>
+                        <td>{{ formatDistance(frame.h) }}</td>
+                        <td>{{ formatDistance(frame.f) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
 
               <div>
-                <h3>Open set kế tiếp</h3>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>#</th>
-                      <th>Lat</th>
-                      <th>Lon</th>
-                      <th>f</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <tr v-for="node in openNodes" :key="`open-${node.index}`">
-                      <td>{{ node.index }}</td>
-                      <td>{{ node.lat.toFixed(4) }}</td>
-                      <td>{{ node.lon.toFixed(4) }}</td>
-                      <td>{{ formatDistance(node.f) }}</td>
-                    </tr>
-                  </tbody>
-                </table>
+                <h3>Đường đi cuối cùng</h3>
+                <div class="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th>
+                        <th>Lat</th>
+                        <th>Lon</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(node, idx) in pathRows" :key="`path-${idx}`">
+                        <td>{{ idx }}</td>
+                        <td>{{ node.lat.toFixed(4) }}</td>
+                        <td>{{ node.lon.toFixed(4) }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </div>
-          <p v-else class="state muted">Nhấn vào bản đồ để chọn điểm bắt đầu và kết thúc.</p>
+
+          <p v-else class="state muted">
+            Chọn hai điểm bất kỳ trên bản đồ để khởi chạy A*.
+          </p>
         </template>
       </section>
     </main>
 
-    <footer>
-      OSRM public demo server • dùng để minh hoạ A* nên số liệu có thể khác Google Maps.
-    </footer>
+    <footer>Demo chạy offline: dữ liệu chỉ gồm lưới giả lập nên kết quả khác bản đồ thực tế.</footer>
   </div>
 </template>
 
@@ -590,6 +917,8 @@ function formatDuration(durationSeconds: number) {
   border-radius: 20px;
   border: 1px solid rgba(148, 163, 184, 0.2);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .map-toolbar {
@@ -648,6 +977,13 @@ function formatDuration(durationSeconds: number) {
   border-bottom-right-radius: 20px;
 }
 
+.map-hint {
+  font-size: 13px;
+  padding: 12px 20px 20px;
+  color: #cbd5f5;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
 .details-panel {
   background: #0b1120;
   border: 1px solid rgba(148, 163, 184, 0.2);
@@ -671,49 +1007,24 @@ function formatDuration(durationSeconds: number) {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: 12px;
-  align-items: center;
+  align-items: flex-start;
 }
 
 .summary-grid strong {
   font-size: 20px;
 }
 
-.follow-toggle label {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  font-size: 14px;
-  color: #e2e8f0;
-}
-
-.slider input {
-  width: 100%;
-  accent-color: #f59e0b;
-}
-
-.frame-card {
-  padding: 16px;
-  border-radius: 16px;
-  background: rgba(46, 16, 101, 0.4);
-  border: 1px solid rgba(99, 102, 241, 0.3);
-}
-
-.metrics {
-  margin-top: 12px;
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-}
-
-.metrics span {
-  font-size: 12px;
-  color: #cbd5f5;
-}
-
 .table-wrapper {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 16px;
+}
+
+.table-scroll {
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 14px;
 }
 
 table {
@@ -727,6 +1038,12 @@ td {
   padding: 8px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.2);
   text-align: left;
+}
+
+th {
+  background: rgba(15, 23, 42, 0.6);
+  position: sticky;
+  top: 0;
 }
 
 .state {
