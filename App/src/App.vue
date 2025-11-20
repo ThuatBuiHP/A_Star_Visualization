@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import osmXml from '../map.osm?raw'
 
 type SelectionMode = 'start' | 'end'
 
@@ -62,20 +63,40 @@ interface SearchRecord extends GridCell {
   key: string
 }
 
-const GRID_MIN_SIZE = 24
-const GRID_MAX_SIZE = 70
-const DEFAULT_GRID_SIZE = 36
+const GRID_MIN_SIZE = 30
+const GRID_MAX_SIZE = 120
+const DEFAULT_GRID_SIZE = 60
 const PADDING_FACTOR = 0.4
 const BLOCK_THRESHOLD = 0.72
 const MIN_SPAN = 0.012
 const MAX_EXPLORATION_MARKERS = 220
+const WALKABLE_DISTANCE_THRESHOLD_METERS = 35
+const OSM_WALKABLE_HIGHWAYS = new Set([
+  'footway',
+  'path',
+  'pedestrian',
+  'living_street',
+  'residential',
+  'service',
+  'track',
+  'unclassified',
+  'steps',
+  'cycleway',
+])
 
 const gridSize = ref(DEFAULT_GRID_SIZE)
 const gridRows = computed(() => gridSize.value)
 const gridCols = computed(() => gridSize.value)
+const isHeavyGrid = computed(() => gridSize.value >= 90)
+const showHeavyPreloader = ref(false)
+const showHeavyLoading = computed(() => showHeavyPreloader.value || (loading.value && isHeavyGrid.value))
+const osmWalkablePoints = ref<LatLngPoint[]>([])
+const osmWalkablePaths = ref<LatLngPoint[][]>([])
+const osmBounds = ref<L.LatLngBoundsLiteral | null>(null)
 
 const mapContainer = ref<HTMLDivElement | null>(null)
 const map = ref<L.Map | null>(null)
+const tileLayerRef = ref<L.TileLayer | null>(null)
 const startPoint = ref<LatLngPoint | null>(null)
 const endPoint = ref<LatLngPoint | null>(null)
 const activeSelection = ref<SelectionMode>('start')
@@ -87,6 +108,7 @@ const startMarker = ref<L.Marker | null>(null)
 const endMarker = ref<L.Marker | null>(null)
 const pathLayer = ref<L.Polyline | null>(null)
 const explorationLayer = ref<L.Polyline | null>(null)
+const osmPathsLayer = ref<L.LayerGroup | null>(null)
 const blockedLayer = ref<L.LayerGroup | null>(null)
 
 const recentFrames = computed(() =>
@@ -96,6 +118,7 @@ const pathRows = computed(() => searchResult.value?.path ?? [])
 const formattedStart = computed(() => formatPoint(startPoint.value))
 const formattedEnd = computed(() => formatPoint(endPoint.value))
 const hasBothPoints = computed(() => Boolean(startPoint.value && endPoint.value))
+const showRealMap = ref(false)
 
 let searchToken = 0
 let explorationAnimationId: number | null = null
@@ -106,24 +129,25 @@ let pathAnimationResolve: (() => void) | null = null
 onMounted(() => {
   if (!mapContainer.value) return
 
-  const createdMap = L.map(mapContainer.value, { zoomControl: true }).setView(
-    [21.0285, 105.8542],
-    13,
-  )
+  const createdMap = L.map(mapContainer.value, { zoomControl: true })
   map.value = createdMap
 
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OSM</a>',
-    maxZoom: 19,
-  }).addTo(createdMap)
+  if (osmBounds.value) {
+    focusOnOsmBounds()
+  } else {
+    createdMap.setView([21.0285, 105.8542], 13)
+  }
 
+  syncBaseLayer()
   createdMap.on('click', handleMapClick)
+  drawOsmWalkablePaths()
 })
 
 onBeforeUnmount(() => {
   stopPathAnimation()
   clearExplorationTrail()
+  clearOsmPathsLayer()
+  clearBaseLayer()
   map.value?.off('click', handleMapClick)
   map.value?.remove()
 })
@@ -141,6 +165,25 @@ watch(gridSize, () => {
     runSearch()
   }
 })
+
+watch(osmWalkablePaths, () => {
+  drawOsmWalkablePaths()
+})
+
+watch(osmBounds, () => {
+  focusOnOsmBounds()
+})
+
+watch(showRealMap, () => {
+  syncBaseLayer()
+})
+
+if (typeof window !== 'undefined' && typeof DOMParser !== 'undefined') {
+  const parsed = parseOsmWalkableData(osmXml)
+  osmWalkablePoints.value = parsed.points
+  osmWalkablePaths.value = parsed.paths
+  osmBounds.value = parsed.bounds
+}
 
 function handleMapClick(event: L.LeafletMouseEvent) {
   const { lat, lng } = event.latlng
@@ -194,6 +237,13 @@ async function runSearch() {
   loading.value = true
   error.value = ''
 
+  if (isHeavyGrid.value) {
+    showHeavyPreloader.value = true
+    await delay(220)
+  } else {
+    showHeavyPreloader.value = false
+  }
+
   await nextTick()
 
   try {
@@ -235,6 +285,7 @@ async function runSearch() {
   } finally {
     if (token === searchToken) {
       loading.value = false
+      showHeavyPreloader.value = false
     }
   }
 }
@@ -247,6 +298,7 @@ function cancelSearch() {
   drawPathOnMap([])
   clearExplorationTrail()
   clearBlockedLayer()
+  showHeavyPreloader.value = false
 }
 
 function stopPathAnimation() {
@@ -273,6 +325,28 @@ function clearExplorationTrail() {
   }
   explorationLayer.value?.remove()
   explorationLayer.value = null
+}
+
+function clearOsmPathsLayer() {
+  osmPathsLayer.value?.remove()
+  osmPathsLayer.value = null
+}
+
+function syncBaseLayer() {
+  const currentMap = map.value as L.Map | null
+  if (!currentMap) return
+  clearBaseLayer()
+  if (!showRealMap.value) return
+  tileLayerRef.value = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution:
+      '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OSM</a>',
+    maxZoom: 19,
+  }).addTo(currentMap)
+}
+
+function clearBaseLayer() {
+  tileLayerRef.value?.remove()
+  tileLayerRef.value = null
 }
 
 async function drawPathOnMap(points: LatLngPoint[], animate = false) {
@@ -322,6 +396,27 @@ async function drawPathOnMap(points: LatLngPoint[], animate = false) {
     }
     pathAnimationId = requestAnimationFrame(step)
   })
+}
+
+function drawOsmWalkablePaths() {
+  const currentMap = map.value as L.Map | null
+  clearOsmPathsLayer()
+  if (!currentMap) return
+  const paths = osmWalkablePaths.value
+  if (!paths.length) return
+  const layer = L.layerGroup()
+  for (const path of paths) {
+    if (!path || path.length < 2) continue
+    const latLngs = path.map((p) => [p.lat, p.lon] as L.LatLngTuple)
+    L.polyline(latLngs, {
+      color: '#fde047',
+      weight: 2,
+      opacity: 0.55,
+      interactive: false,
+    }).addTo(layer)
+  }
+  layer.addTo(currentMap)
+  osmPathsLayer.value = layer
 }
 
 async function drawExplorationMarkers(frames: AStarFrame[]) {
@@ -425,6 +520,15 @@ function focusOnPath(points: LatLngPoint[]) {
   currentMap.fitBounds(bounds, { padding: [24, 24] })
 }
 
+function focusOnOsmBounds() {
+  const currentMap = map.value as L.Map | null
+  const boundsLiteral = osmBounds.value
+  if (!currentMap || !boundsLiteral) return
+  const bounds = L.latLngBounds(boundsLiteral)
+  currentMap.fitBounds(bounds, { padding: [24, 24] })
+  currentMap.setMaxBounds(bounds.pad(0.15))
+}
+
 function focusOnGrid(meta: GridMeta) {
   const currentMap = map.value as L.Map | null
   if (!currentMap) return
@@ -448,6 +552,7 @@ function resetAll() {
   drawPathOnMap([])
   clearExplorationTrail()
   clearBlockedLayer()
+  showHeavyPreloader.value = false
 }
 
 function swapPoints() {
@@ -459,6 +564,80 @@ function swapPoints() {
   placeMarker(endMarker, endPoint.value, '#dc2626', 'G')
 }
 
+function parseOsmWalkableData(xml: string) {
+  if (!xml) {
+    return { points: [], paths: [], bounds: null }
+  }
+  try {
+    const parser = new DOMParser()
+    const doc = parser.parseFromString(xml, 'text/xml')
+    const nodeElements = Array.from(doc.getElementsByTagName('node'))
+    const nodes = new Map<string, LatLngPoint>()
+    let minLat = Number.POSITIVE_INFINITY
+    let maxLat = Number.NEGATIVE_INFINITY
+    let minLon = Number.POSITIVE_INFINITY
+    let maxLon = Number.NEGATIVE_INFINITY
+    for (const nodeEl of nodeElements) {
+      const id = nodeEl.getAttribute('id')
+      const lat = Number(nodeEl.getAttribute('lat'))
+      const lon = Number(nodeEl.getAttribute('lon'))
+      if (!id || Number.isNaN(lat) || Number.isNaN(lon)) continue
+      nodes.set(id, { lat, lon })
+      if (lat < minLat) minLat = lat
+      if (lat > maxLat) maxLat = lat
+      if (lon < minLon) minLon = lon
+      if (lon > maxLon) maxLon = lon
+    }
+
+    const walkablePoints = new Map<string, LatLngPoint>()
+    const walkablePaths: LatLngPoint[][] = []
+    const wayElements = Array.from(doc.getElementsByTagName('way'))
+    for (const wayEl of wayElements) {
+      const tagElements = Array.from(wayEl.getElementsByTagName('tag'))
+      let highway: string | null = null
+      let foot: string | null = null
+      let access: string | null = null
+      for (const tagEl of tagElements) {
+        const key = tagEl.getAttribute('k')
+        const value = tagEl.getAttribute('v')
+        if (!key || !value) continue
+        if (key === 'highway') highway = value
+        if (key === 'foot') foot = value
+        if (key === 'access') access = value
+      }
+      const isWalkableHighway = Boolean(highway && OSM_WALKABLE_HIGHWAYS.has(highway))
+      const allowsFoot = foot === 'yes' || access === 'permissive' || access === 'yes'
+      if (!isWalkableHighway && !allowsFoot) continue
+
+      const ndElements = Array.from(wayEl.getElementsByTagName('nd'))
+      const pathPoints: LatLngPoint[] = []
+      for (const nd of ndElements) {
+        const ref = nd.getAttribute('ref')
+        if (!ref) continue
+        const point = nodes.get(ref)
+        if (point) {
+          walkablePoints.set(ref, point)
+          pathPoints.push(point)
+        }
+      }
+      if (pathPoints.length >= 2) {
+        walkablePaths.push(pathPoints)
+      }
+    }
+    const hasBounds =
+      Number.isFinite(minLat) && Number.isFinite(maxLat) && Number.isFinite(minLon) && Number.isFinite(maxLon)
+
+    return {
+      points: Array.from(walkablePoints.values()),
+      paths: walkablePaths,
+      bounds: hasBounds ? ([ [minLat, minLon], [maxLat, maxLon] ] as L.LatLngBoundsLiteral) : null,
+    }
+  } catch (err) {
+    console.warn('Không đọc được dữ liệu walkable từ OSM.', err)
+    return { points: [], paths: [], bounds: null }
+  }
+}
+
 function buildGrid(start: LatLngPoint, end: LatLngPoint): BuiltGrid {
   const latSpan = Math.max(Math.abs(end.lat - start.lat), MIN_SPAN)
   const lonSpan = Math.max(Math.abs(end.lon - start.lon), MIN_SPAN)
@@ -468,6 +647,7 @@ function buildGrid(start: LatLngPoint, end: LatLngPoint): BuiltGrid {
   const lonMax = Math.max(start.lon, end.lon) + lonSpan * PADDING_FACTOR
   const rows = gridRows.value
   const cols = gridCols.value
+  const walkableCandidates = filterWalkablePointsForMeta(latMin, latMax, lonMin, lonMax)
 
   const meta: GridMeta = {
     rows,
@@ -490,7 +670,9 @@ function buildGrid(start: LatLngPoint, end: LatLngPoint): BuiltGrid {
       const lat = latMin + (row + 0.5) * meta.latStep
       const lon = lonMin + (col + 0.5) * meta.lonStep
       const noise = pseudoNoise(lat, lon)
-      const walkable = noise > BLOCK_THRESHOLD ? false : true
+      const walkable = walkableCandidates?.length
+        ? isPointNearWalkable(lat, lon, walkableCandidates)
+        : noise <= BLOCK_THRESHOLD
       if (!walkable) blocked += 1
       const cell: GridCell = { row, col, lat, lon, walkable }
       rowCells.push(cell)
@@ -505,6 +687,30 @@ function buildGrid(start: LatLngPoint, end: LatLngPoint): BuiltGrid {
     blockedRatio: blocked / (rows * cols),
     cellLookup: lookup,
   }
+}
+
+function filterWalkablePointsForMeta(latMin: number, latMax: number, lonMin: number, lonMax: number) {
+  const dataset = osmWalkablePoints.value
+  if (!dataset.length) return null
+  const latPad = (latMax - latMin) * 0.1
+  const lonPad = (lonMax - lonMin) * 0.1
+  return dataset.filter(
+    (point) =>
+      point.lat >= latMin - latPad &&
+      point.lat <= latMax + latPad &&
+      point.lon >= lonMin - lonPad &&
+      point.lon <= lonMax + lonPad,
+  )
+}
+
+function isPointNearWalkable(lat: number, lon: number, candidates: LatLngPoint[]) {
+  for (const point of candidates) {
+    const distance = haversine(lat, lon, point.lat, point.lon)
+    if (distance <= WALKABLE_DISTANCE_THRESHOLD_METERS) {
+      return true
+    }
+  }
+  return false
 }
 
 function locateCell(point: LatLngPoint, grid: BuiltGrid): GridCell {
@@ -690,6 +896,16 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
 }
 
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    if (ms <= 0) {
+      resolve()
+      return
+    }
+    setTimeout(resolve, ms)
+  })
+}
+
 function formatPoint(point: LatLngPoint | null) {
   if (!point) return '--'
   return `${point.lat.toFixed(5)}, ${point.lon.toFixed(5)}`
@@ -834,8 +1050,20 @@ class MinHeap<T> {
               <p class="coord">{{ formattedEnd }}</p>
             </div>
           </div>
+          <div class="base-toggle">
+            <p class="label">Nền bản đồ</p>
+            <button class="map-toggle-btn" :class="{ active: showRealMap }" @click="showRealMap = !showRealMap">
+              {{ showRealMap ? 'Bản đồ OSM' : 'Overlay đơn giản' }}
+            </button>
+          </div>
         </div>
-        <div ref="mapContainer" class="map-container"></div>
+        <div class="map-stage">
+          <div ref="mapContainer" class="map-container"></div>
+          <div v-if="showHeavyLoading" class="map-preloader">
+            <div class="spinner"></div>
+            <p>Lưới lớn {{ gridRows }}×{{ gridCols }} đang được dựng...</p>
+          </div>
+        </div>
         <p class="map-hint">
           Ô màu đỏ = chướng ngại. Vệt cam thể hiện các node đã được mở rộng trong quá trình chạy
           A*.
@@ -897,29 +1125,6 @@ class MinHeap<T> {
               </div>
             </div>
 
-            <div class="table-wrapper">
-              <div>
-                <h3>Đường đi cuối cùng</h3>
-                <div class="table-scroll">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>#</th>
-                        <th>Lat</th>
-                        <th>Lon</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <tr v-for="(node, idx) in pathRows" :key="`path-${idx}`">
-                        <td>{{ idx }}</td>
-                        <td>{{ node.lat.toFixed(4) }}</td>
-                        <td>{{ node.lon.toFixed(4) }}</td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
           </div>
 
           <p v-else class="state muted">
@@ -1063,13 +1268,69 @@ class MinHeap<T> {
   gap: 24px;
 }
 
+.base-toggle {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.map-toggle-btn {
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(15, 23, 42, 0.6);
+  color: #e2e8f0;
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.map-toggle-btn.active {
+  background: #22d3ee;
+  border-color: #0ea5e9;
+  color: #0f172a;
+}
+
 .coord {
   font-size: 14px;
   color: #e2e8f0;
 }
 
+.map-stage {
+  position: relative;
+  border-radius: 20px;
+  overflow: hidden;
+}
+
 .map-container {
   height: clamp(320px, 60vh, 520px);
+  background: #020617;
+}
+
+.map-preloader {
+  position: absolute;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.88);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  padding: 20px;
+  color: #e2e8f0;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  z-index: 20;
+}
+
+.map-preloader .spinner {
+  width: 46px;
+  height: 46px;
+  border-radius: 999px;
+  border: 3px solid rgba(248, 250, 252, 0.18);
+  border-top-color: #38bdf8;
+  animation: spin 0.8s linear infinite;
 }
 
 :global(.leaflet-container) {
@@ -1144,38 +1405,6 @@ class MinHeap<T> {
   font-size: 20px;
 }
 
-.table-wrapper {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 16px;
-}
-
-.table-scroll {
-  max-height: 280px;
-  overflow: auto;
-  border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 14px;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-
-th,
-td {
-  padding: 8px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
-  text-align: left;
-}
-
-th {
-  background: rgba(15, 23, 42, 0.6);
-  position: sticky;
-  top: 0;
-}
-
 .state {
   padding: 12px 14px;
   border-radius: 12px;
@@ -1217,5 +1446,11 @@ footer {
   font-size: 12px;
   color: #94a3b8;
   margin-top: auto;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 </style>
