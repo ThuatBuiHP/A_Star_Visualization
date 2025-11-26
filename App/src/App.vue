@@ -11,28 +11,22 @@ interface LatLngPoint {
   lon: number
 }
 
-interface GridMeta {
-  rows: number
-  cols: number
-  latMin: number
-  latMax: number
-  lonMin: number
-  lonMax: number
-  latStep: number
-  lonStep: number
+interface GraphNode extends LatLngPoint {
+  id: string
 }
 
-interface GridCell extends LatLngPoint {
-  row: number
-  col: number
-  walkable: boolean
+interface GraphEdge {
+  to: string
+  cost: number
 }
 
-interface BuiltGrid {
-  meta: GridMeta
-  cells: GridCell[][]
-  blockedRatio: number
-  cellLookup: Map<string, GridCell>
+interface GraphData {
+  nodes: Map<string, GraphNode>
+  adjacency: Map<string, GraphEdge[]>
+  nodeList: GraphNode[]
+  bounds: L.LatLngBoundsLiteral | null
+  wayCount: number
+  edgeCount: number
 }
 
 interface AStarFrame {
@@ -49,28 +43,23 @@ interface AStarFrame {
 interface SearchResult {
   path: LatLngPoint[]
   frames: AStarFrame[]
-  gridMeta: GridMeta
-  blockedRatio: number
   pathDistance: number
   expanded: number
   generated: number
+  nodeCount: number
+  edgeCount: number
+  wayCount: number
 }
 
-interface SearchRecord extends GridCell {
+interface GraphSearchRecord extends GraphNode {
   g: number
   h: number
   f: number
-  key: string
 }
 
-const GRID_MIN_SIZE = 100
-const GRID_MAX_SIZE = 200
-const DEFAULT_GRID_SIZE = 150
-const PADDING_FACTOR = 0.4
-const BLOCK_THRESHOLD = 0.72
-const MIN_SPAN = 0.012
 const MAX_EXPLORATION_MARKERS = 220
-const WALKABLE_DISTANCE_THRESHOLD_METERS = 35
+const WALKABLE_DISTANCE_THRESHOLD_METERS = 45
+const MAX_SNAP_DISTANCE_METERS = 250
 const OSM_WALKABLE_HIGHWAYS = new Set([
   'footway',
   'path',
@@ -84,15 +73,10 @@ const OSM_WALKABLE_HIGHWAYS = new Set([
   'cycleway',
 ])
 
-const gridSize = ref(DEFAULT_GRID_SIZE)
-const gridRows = computed(() => gridSize.value)
-const gridCols = computed(() => gridSize.value)
-const isHeavyGrid = computed(() => gridSize.value >= 160)
-const showHeavyPreloader = ref(false)
-const showHeavyLoading = computed(() => showHeavyPreloader.value || (loading.value && isHeavyGrid.value))
 const osmWalkablePoints = ref<LatLngPoint[]>([])
 const osmWalkablePaths = ref<LatLngPoint[][]>([])
 const osmBounds = ref<L.LatLngBoundsLiteral | null>(null)
+const osmGraph = ref<GraphData | null>(null)
 
 const mapContainer = ref<HTMLDivElement | null>(null)
 const map = ref<L.Map | null>(null)
@@ -109,7 +93,6 @@ const endMarker = ref<L.Marker | null>(null)
 const pathLayer = ref<L.Polyline | null>(null)
 const explorationLayer = ref<L.Polyline | null>(null)
 const osmPathsLayer = ref<L.LayerGroup | null>(null)
-const blockedLayer = ref<L.LayerGroup | null>(null)
 
 const recentFrames = computed(() =>
   searchResult.value ? searchResult.value.frames.slice(-12).reverse() : [],
@@ -120,6 +103,7 @@ const formattedEnd = computed(() => formatPoint(endPoint.value))
 const showRealMap = ref(false)
 const hasBothPoints = computed(() => Boolean(startPoint.value && endPoint.value))
 const showExplorationLine = ref(true)
+const showLoadingOverlay = computed(() => loading.value)
 
 let searchToken = 0
 let explorationAnimationId: number | null = null
@@ -161,12 +145,6 @@ watch([startPoint, endPoint], ([start, end]) => {
   }
 })
 
-watch(gridSize, () => {
-  if (hasBothPoints.value) {
-    runSearch()
-  }
-})
-
 watch(osmWalkablePaths, () => {
   drawOsmWalkablePaths()
 })
@@ -194,6 +172,7 @@ if (typeof window !== 'undefined' && typeof DOMParser !== 'undefined') {
   osmWalkablePoints.value = parsed.points
   osmWalkablePaths.value = parsed.paths
   osmBounds.value = parsed.bounds
+  osmGraph.value = parsed.graph
 }
 
 function handleMapClick(event: L.LeafletMouseEvent) {
@@ -242,44 +221,45 @@ function placeMarker(
 async function runSearch() {
   const start = startPoint.value
   const end = endPoint.value
-  if (!start || !end) return
+  const graph = osmGraph.value
+  if (!start || !end || !graph) return
 
   const token = ++searchToken
   loading.value = true
   error.value = ''
 
-  if (isHeavyGrid.value) {
-    showHeavyPreloader.value = true
-    await delay(220)
-  } else {
-    showHeavyPreloader.value = false
-  }
-
   await nextTick()
 
   try {
-    const builtGrid = buildGrid(start, end)
-    const startCell = locateCell(start, builtGrid)
-    const goalCell = locateCell(end, builtGrid)
-    startCell.walkable = true
-    goalCell.walkable = true
+    const startNode = findClosestGraphNode(start, graph.nodeList)
+    const goalNode = findClosestGraphNode(end, graph.nodeList)
 
-    const result = runAStarOnGrid(builtGrid, startCell, goalCell)
+    if (!startNode || !goalNode) {
+      searchResult.value = null
+      await drawPathOnMap([])
+      clearExplorationTrail()
+      error.value = 'Không tìm được node giao thông nào đủ gần hai điểm bạn chọn.'
+      return
+    }
+
+    const result = runAStarOnGraph(graph, startNode, goalNode)
 
     if (token !== searchToken) return
-
-    drawBlockedCells(builtGrid)
 
     if (!result.path.length) {
       searchResult.value = null
       await drawPathOnMap([])
       clearExplorationTrail()
-      focusOnGrid(builtGrid.meta)
-      error.value = 'Không tìm thấy đường đi vì chướng ngại quá dày ở vùng này.'
+      error.value = 'Không tìm thấy đường kết nối hai nút trên bản đồ OSM.'
       return
     }
 
-    searchResult.value = result
+    searchResult.value = {
+      ...result,
+      nodeCount: graph.nodeList.length,
+      edgeCount: graph.edgeCount,
+      wayCount: graph.wayCount,
+    }
     await drawPathOnMap([])
     await drawExplorationMarkers(result.frames)
     if (token !== searchToken) return
@@ -292,11 +272,10 @@ async function runSearch() {
     searchResult.value = null
     await drawPathOnMap([])
     clearExplorationTrail()
-    error.value = err instanceof Error ? err.message : 'Đã có lỗi trong lúc chạy A*.'
+    error.value = err instanceof Error ? err.message : 'Đã có lỗi trong lúc chạy tìm đường.'
   } finally {
     if (token === searchToken) {
       loading.value = false
-      showHeavyPreloader.value = false
     }
   }
 }
@@ -308,8 +287,6 @@ function cancelSearch() {
   error.value = ''
   drawPathOnMap([])
   clearExplorationTrail()
-  clearBlockedLayer()
-  showHeavyPreloader.value = false
 }
 
 function stopPathAnimation() {
@@ -484,44 +461,6 @@ async function drawExplorationMarkers(frames: AStarFrame[]) {
   })
 }
 
-function drawBlockedCells(grid: BuiltGrid) {
-  const currentMap = map.value as L.Map | null
-  clearBlockedLayer()
-  if (!currentMap) return
-
-  const group = L.layerGroup()
-  for (const row of grid.cells) {
-    for (const cell of row) {
-      if (cell.walkable) continue
-      const south = grid.meta.latMin + cell.row * grid.meta.latStep
-      const north = south + grid.meta.latStep
-      const west = grid.meta.lonMin + cell.col * grid.meta.lonStep
-      const east = west + grid.meta.lonStep
-      const rect = L.rectangle(
-        [
-          [south, west],
-          [north, east],
-        ],
-        {
-          color: '#f87171',
-          weight: 0,
-          fillColor: '#ef4444',
-          fillOpacity: 0.22,
-          className: 'blocked-cell',
-        },
-      )
-      group.addLayer(rect)
-    }
-  }
-  group.addTo(currentMap)
-  blockedLayer.value = group
-}
-
-function clearBlockedLayer() {
-  blockedLayer.value?.remove()
-  blockedLayer.value = null
-}
-
 function focusOnPath(points: LatLngPoint[]) {
   const currentMap = map.value as L.Map | null
   if (!currentMap || !points.length) return
@@ -540,16 +479,6 @@ function focusOnOsmBounds() {
   currentMap.setMaxBounds(bounds.pad(0.15))
 }
 
-function focusOnGrid(meta: GridMeta) {
-  const currentMap = map.value as L.Map | null
-  if (!currentMap) return
-  const bounds = L.latLngBounds(
-    [meta.latMin, meta.lonMin],
-    [meta.latMax, meta.lonMax],
-  )
-  currentMap.fitBounds(bounds, { padding: [24, 24] })
-}
-
 function resetAll() {
   startPoint.value = null
   endPoint.value = null
@@ -562,19 +491,25 @@ function resetAll() {
   endMarker.value = null
   drawPathOnMap([])
   clearExplorationTrail()
-  clearBlockedLayer()
-  showHeavyPreloader.value = false
 }
 
 function parseOsmWalkableData(xml: string) {
+  const emptyGraph: GraphData = {
+    nodes: new Map(),
+    adjacency: new Map(),
+    nodeList: [],
+    bounds: null,
+    wayCount: 0,
+    edgeCount: 0,
+  }
   if (!xml) {
-    return { points: [], paths: [], bounds: null }
+    return { points: [], paths: [], bounds: null, graph: emptyGraph }
   }
   try {
     const parser = new DOMParser()
     const doc = parser.parseFromString(xml, 'text/xml')
     const nodeElements = Array.from(doc.getElementsByTagName('node'))
-    const nodes = new Map<string, LatLngPoint>()
+    const nodes = new Map<string, GraphNode>()
     let minLat = Number.POSITIVE_INFINITY
     let maxLat = Number.NEGATIVE_INFINITY
     let minLon = Number.POSITIVE_INFINITY
@@ -584,16 +519,19 @@ function parseOsmWalkableData(xml: string) {
       const lat = Number(nodeEl.getAttribute('lat'))
       const lon = Number(nodeEl.getAttribute('lon'))
       if (!id || Number.isNaN(lat) || Number.isNaN(lon)) continue
-      nodes.set(id, { lat, lon })
+      nodes.set(id, { id, lat, lon })
       if (lat < minLat) minLat = lat
       if (lat > maxLat) maxLat = lat
       if (lon < minLon) minLon = lon
       if (lon > maxLon) maxLon = lon
     }
 
-    const walkablePoints = new Map<string, LatLngPoint>()
+    const walkableNodes = new Map<string, GraphNode>()
+    const adjacency = new Map<string, GraphEdge[]>()
     const walkablePaths: LatLngPoint[][] = []
     const wayElements = Array.from(doc.getElementsByTagName('way'))
+    let wayCount = 0
+
     for (const wayEl of wayElements) {
       const tagElements = Array.from(wayEl.getElementsByTagName('tag'))
       let highway: string | null = null
@@ -612,153 +550,110 @@ function parseOsmWalkableData(xml: string) {
       if (!isWalkableHighway && !allowsFoot) continue
 
       const ndElements = Array.from(wayEl.getElementsByTagName('nd'))
+      const pathNodeIds: string[] = []
       const pathPoints: LatLngPoint[] = []
       for (const nd of ndElements) {
         const ref = nd.getAttribute('ref')
         if (!ref) continue
-        const point = nodes.get(ref)
-        if (point) {
-          walkablePoints.set(ref, point)
-          pathPoints.push(point)
+        const node = nodes.get(ref)
+        if (!node) continue
+        pathNodeIds.push(ref)
+        pathPoints.push({ lat: node.lat, lon: node.lon })
+        walkableNodes.set(ref, node)
+      }
+
+      if (pathPoints.length >= 2) {
+        wayCount += 1
+        walkablePaths.push(pathPoints)
+        for (let i = 1; i < pathNodeIds.length; i += 1) {
+          const prevId = pathNodeIds[i - 1]
+          const currId = pathNodeIds[i]
+          if (!prevId || !currId) continue
+          const prevNode = nodes.get(prevId)
+          const currNode = nodes.get(currId)
+          if (!prevNode || !currNode) continue
+          const distance = haversine(prevNode.lat, prevNode.lon, currNode.lat, currNode.lon)
+          addEdge(adjacency, prevId, currId, distance)
+          addEdge(adjacency, currId, prevId, distance)
         }
       }
-      if (pathPoints.length >= 2) {
-        walkablePaths.push(pathPoints)
-      }
     }
+
     const hasBounds =
       Number.isFinite(minLat) && Number.isFinite(maxLat) && Number.isFinite(minLon) && Number.isFinite(maxLon)
+    const nodeList = Array.from(walkableNodes.values())
+    const totalEdges = Array.from(adjacency.values()).reduce((sum, edges) => sum + edges.length, 0)
+
+    const graph: GraphData = {
+      nodes: walkableNodes,
+      adjacency,
+      nodeList,
+      bounds: hasBounds ? ([ [minLat, minLon], [maxLat, maxLon] ] as L.LatLngBoundsLiteral) : null,
+      wayCount,
+      edgeCount: totalEdges,
+    }
 
     return {
-      points: Array.from(walkablePoints.values()),
+      points: nodeList.map((node) => ({ lat: node.lat, lon: node.lon })),
       paths: walkablePaths,
-      bounds: hasBounds ? ([ [minLat, minLon], [maxLat, maxLon] ] as L.LatLngBoundsLiteral) : null,
+      bounds: graph.bounds,
+      graph,
     }
   } catch (err) {
     console.warn('Không đọc được dữ liệu walkable từ OSM.', err)
-    return { points: [], paths: [], bounds: null }
+    return { points: [], paths: [], bounds: null, graph: emptyGraph }
   }
 }
 
-function buildGrid(start: LatLngPoint, end: LatLngPoint): BuiltGrid {
-  const latSpan = Math.max(Math.abs(end.lat - start.lat), MIN_SPAN)
-  const lonSpan = Math.max(Math.abs(end.lon - start.lon), MIN_SPAN)
-  const latMin = Math.min(start.lat, end.lat) - latSpan * PADDING_FACTOR
-  const latMax = Math.max(start.lat, end.lat) + latSpan * PADDING_FACTOR
-  const lonMin = Math.min(start.lon, end.lon) - lonSpan * PADDING_FACTOR
-  const lonMax = Math.max(start.lon, end.lon) + lonSpan * PADDING_FACTOR
-  const rows = gridRows.value
-  const cols = gridCols.value
-  const walkableCandidates = filterWalkablePointsForMeta(latMin, latMax, lonMin, lonMax)
-
-  const meta: GridMeta = {
-    rows,
-    cols,
-    latMin,
-    latMax,
-    lonMin,
-    lonMax,
-    latStep: (latMax - latMin) / rows,
-    lonStep: (lonMax - lonMin) / cols,
-  }
-
-  const cells: GridCell[][] = []
-  const lookup = new Map<string, GridCell>()
-  let blocked = 0
-
-  for (let row = 0; row < rows; row += 1) {
-    const rowCells: GridCell[] = []
-    for (let col = 0; col < cols; col += 1) {
-      const lat = latMin + (row + 0.5) * meta.latStep
-      const lon = lonMin + (col + 0.5) * meta.lonStep
-      const noise = pseudoNoise(lat, lon)
-      const walkable = walkableCandidates?.length
-        ? isPointNearWalkable(lat, lon, walkableCandidates)
-        : noise <= BLOCK_THRESHOLD
-      if (!walkable) blocked += 1
-      const cell: GridCell = { row, col, lat, lon, walkable }
-      rowCells.push(cell)
-      lookup.set(cellKey(row, col), cell)
-    }
-    cells.push(rowCells)
-  }
-
-  return {
-    meta,
-    cells,
-    blockedRatio: blocked / (rows * cols),
-    cellLookup: lookup,
+function addEdge(adjacency: Map<string, GraphEdge[]>, from: string, to: string, cost: number) {
+  const list = adjacency.get(from)
+  if (list) {
+    list.push({ to, cost })
+  } else {
+    adjacency.set(from, [{ to, cost }])
   }
 }
 
-function filterWalkablePointsForMeta(latMin: number, latMax: number, lonMin: number, lonMax: number) {
-  const dataset = osmWalkablePoints.value
-  if (!dataset.length) return null
-  const latPad = (latMax - latMin) * 0.1
-  const lonPad = (lonMax - lonMin) * 0.1
-  return dataset.filter(
-    (point) =>
-      point.lat >= latMin - latPad &&
-      point.lat <= latMax + latPad &&
-      point.lon >= lonMin - lonPad &&
-      point.lon <= lonMax + lonPad,
-  )
-}
-
-function isPointNearWalkable(lat: number, lon: number, candidates: LatLngPoint[]) {
-  for (const point of candidates) {
-    const distance = haversine(lat, lon, point.lat, point.lon)
-    if (distance <= WALKABLE_DISTANCE_THRESHOLD_METERS) {
-      return true
+function findClosestGraphNode(point: LatLngPoint, nodes: GraphNode[]) {
+  if (!nodes.length) return null
+  let closest: GraphNode | null = null
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const node of nodes) {
+    const distance = haversine(point.lat, point.lon, node.lat, node.lon)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      closest = node
     }
   }
-  return false
-}
-
-function locateCell(point: LatLngPoint, grid: BuiltGrid): GridCell {
-  const row = clamp(
-    Math.floor(((point.lat - grid.meta.latMin) / (grid.meta.latMax - grid.meta.latMin)) * grid.meta.rows),
-    0,
-    grid.meta.rows - 1,
-  )
-  const col = clamp(
-    Math.floor(((point.lon - grid.meta.lonMin) / (grid.meta.lonMax - grid.meta.lonMin)) * grid.meta.cols),
-    0,
-    grid.meta.cols - 1,
-  )
-  const fallback = grid.cells[0]?.[0]
-  if (!fallback) {
-    throw new Error('Lưới chưa sẵn sàng.')
+  if (bestDistance > MAX_SNAP_DISTANCE_METERS) {
+    return null
   }
-  return grid.cells[row]?.[col] ?? fallback
+  return closest
 }
 
-function runAStarOnGrid(grid: BuiltGrid, startCell: GridCell, goalCell: GridCell): SearchResult {
-  const startKey = cellKey(startCell.row, startCell.col)
-  const goalKey = cellKey(goalCell.row, goalCell.col)
-  const openHeap = new MinHeap<SearchRecord>((a, b) => a.f - b.f)
+function runAStarOnGraph(graph: GraphData, startNode: GraphNode, goalNode: GraphNode) {
+  const openHeap = new MinHeap<GraphSearchRecord>((a, b) => a.f - b.f)
   const bestG = new Map<string, number>()
   const parents = new Map<string, string | null>()
-  const openTracker = new Map<string, SearchRecord>()
-  const closedSet = new Set<string>()
+  const openTracker = new Map<string, GraphSearchRecord>()
   const frames: AStarFrame[] = []
   let generated = 0
 
-  const hStart = haversine(startCell.lat, startCell.lon, goalCell.lat, goalCell.lon)
-  const startRecord: SearchRecord = { ...startCell, g: 0, h: hStart, f: hStart, key: startKey }
+  const hStart = haversine(startNode.lat, startNode.lon, goalNode.lat, goalNode.lon)
+  const startRecord: GraphSearchRecord = { ...startNode, g: 0, h: hStart, f: hStart }
   openHeap.push(startRecord)
-  openTracker.set(startKey, startRecord)
-  bestG.set(startKey, 0)
-  parents.set(startKey, null)
+  openTracker.set(startNode.id, startRecord)
+  bestG.set(startNode.id, 0)
+  parents.set(startNode.id, null)
 
   while (openHeap.size() > 0) {
     const current = openHeap.pop()
     if (!current) break
-    const known = bestG.get(current.key)
+    const known = bestG.get(current.id)
     if (known === undefined || current.g > known) {
       continue
     }
-    openTracker.delete(current.key)
+    openTracker.delete(current.id)
 
     frames.push({
       index: frames.length,
@@ -771,43 +666,39 @@ function runAStarOnGrid(grid: BuiltGrid, startCell: GridCell, goalCell: GridCell
       closedSize: frames.length + 1,
     })
 
-    if (current.key === goalKey) {
-      const path = buildPath(current.key, parents, grid.cellLookup)
+    if (current.id === goalNode.id) {
+      const path = buildGraphPath(current.id, parents, graph.nodes)
       return {
         path,
         frames,
-        gridMeta: grid.meta,
-        blockedRatio: grid.blockedRatio,
         pathDistance: computePathDistance(path),
         expanded: frames.length,
         generated,
       }
     }
 
-    closedSet.add(current.key)
+    const neighbors = graph.adjacency.get(current.id) ?? []
+    for (const edge of neighbors) {
+      const neighborNode = graph.nodes.get(edge.to)
+      if (!neighborNode) continue
 
-    for (const neighbor of findNeighbors(current, grid)) {
-      const neighborKey = cellKey(neighbor.row, neighbor.col)
-      if (closedSet.has(neighborKey) || !neighbor.walkable) continue
-
-      const tentativeG = current.g + haversine(current.lat, current.lon, neighbor.lat, neighbor.lon)
-      const bestNeighbor = bestG.get(neighborKey)
+      const tentativeG = current.g + edge.cost
+      const bestNeighbor = bestG.get(neighborNode.id)
       if (bestNeighbor !== undefined && tentativeG >= bestNeighbor) {
         continue
       }
 
-      const h = haversine(neighbor.lat, neighbor.lon, goalCell.lat, goalCell.lon)
-      const record: SearchRecord = {
-        ...neighbor,
+      const h = haversine(neighborNode.lat, neighborNode.lon, goalNode.lat, goalNode.lon)
+      const record: GraphSearchRecord = {
+        ...neighborNode,
         g: tentativeG,
         h,
         f: tentativeG + h,
-        key: neighborKey,
       }
 
-      bestG.set(neighborKey, tentativeG)
-      parents.set(neighborKey, current.key)
-      openTracker.set(neighborKey, record)
+      bestG.set(neighborNode.id, tentativeG)
+      parents.set(neighborNode.id, current.id)
+      openTracker.set(neighborNode.id, record)
       openHeap.push(record)
       generated += 1
     }
@@ -816,47 +707,19 @@ function runAStarOnGrid(grid: BuiltGrid, startCell: GridCell, goalCell: GridCell
   return {
     path: [],
     frames,
-    gridMeta: grid.meta,
-    blockedRatio: grid.blockedRatio,
     pathDistance: 0,
     expanded: frames.length,
     generated,
   }
 }
 
-function findNeighbors(cell: GridCell, grid: BuiltGrid) {
-  const neighbors: GridCell[] = []
-  for (const [dr, dc] of neighborOffsets) {
-    const nr = cell.row + dr
-    const nc = cell.col + dc
-    if (nr < 0 || nr >= grid.meta.rows || nc < 0 || nc >= grid.meta.cols) continue
-    const rowCells = grid.cells[nr]
-    if (!rowCells) continue
-    const neighbor = rowCells[nc]
-    if (!neighbor) continue
-    neighbors.push(neighbor)
-  }
-  return neighbors
-}
-
-const neighborOffsets: Array<[number, number]> = [
-  [1, 0],
-  [-1, 0],
-  [0, 1],
-  [0, -1],
-  [1, 1],
-  [1, -1],
-  [-1, 1],
-  [-1, -1],
-]
-
-function buildPath(key: string, parents: Map<string, string | null>, lookup: Map<string, GridCell>) {
+function buildGraphPath(key: string, parents: Map<string, string | null>, nodes: Map<string, GraphNode>) {
   const path: LatLngPoint[] = []
   let currentKey: string | null | undefined = key
   while (currentKey) {
-    const cell = lookup.get(currentKey)
-    if (!cell) break
-    path.push({ lat: cell.lat, lon: cell.lon })
+    const node = nodes.get(currentKey)
+    if (!node) break
+    path.push({ lat: node.lat, lon: node.lon })
     currentKey = parents.get(currentKey) ?? null
   }
   return path.reverse()
@@ -873,10 +736,6 @@ function computePathDistance(points: LatLngPoint[]) {
   return total
 }
 
-function cellKey(row: number, col: number) {
-  return `${row}:${col}`
-}
-
 function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
   const R = 6371000
   const toRad = (deg: number) => (deg * Math.PI) / 180
@@ -887,25 +746,6 @@ function haversine(lat1: number, lon1: number, lat2: number, lon2: number) {
     Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2)
   const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
   return R * c
-}
-
-function pseudoNoise(lat: number, lon: number) {
-  const raw = Math.sin(lat * 21.9898 + lon * 47.233 + lat * lon * 11.73) * 43758.5453
-  return raw - Math.floor(raw)
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value))
-}
-
-function delay(ms: number) {
-  return new Promise<void>((resolve) => {
-    if (ms <= 0) {
-      resolve()
-      return
-    }
-    setTimeout(resolve, ms)
-  })
 }
 
 function formatPoint(point: LatLngPoint | null) {
@@ -1070,43 +910,44 @@ class MinHeap<T> {
         </div>
         <div class="map-stage">
           <div ref="mapContainer" class="map-container"></div>
-          <div v-if="showHeavyLoading" class="map-preloader">
+          <div v-if="showLoadingOverlay" class="map-preloader">
             <div class="spinner"></div>
-            <p>Lưới lớn {{ gridRows }}×{{ gridCols }} đang được dựng...</p>
+            <p>Đang dựng graph từ dữ liệu OSM và chạy A*...</p>
           </div>
         </div>
         <p class="map-hint">
-          Ô màu đỏ = chướng ngại. Vệt cam thể hiện các node đã được mở rộng trong quá trình chạy
-          A*.
+          Đường đỏ thể hiện thứ tự các node đã được mở rộng trong quá trình chạy A* trên graph OSM.
         </p>
       </section>
 
       <section class="details-panel">
         <h2>Diễn tiến tìm đường</h2>
-        <div class="grid-density">
+        <div class="graph-density">
           <div>
-            <p class="label">Độ chi tiết lưới</p>
-            <p class="grid-density-note">Kéo thanh trượt để tăng/giảm số lượng ô.</p>
+            <p class="label">Graph đang dùng</p>
+            <p class="graph-density-note">Dữ liệu lấy từ file OSM cục bộ, lọc theo các loại đường cho người đi bộ.</p>
           </div>
-          <div class="grid-density-control">
-            <input
-              class="grid-density-slider"
-              type="range"
-              :min="GRID_MIN_SIZE"
-              :max="GRID_MAX_SIZE"
-              step="2"
-              v-model.number="gridSize"
-            />
-            <span>{{ gridRows }}×{{ gridCols }}</span>
+          <div class="graph-density-stats">
+            <div>
+              <p class="label">Nodes</p>
+              <strong>{{ osmGraph?.nodeList.length ?? 0 }}</strong>
+            </div>
+            <div>
+              <p class="label">Cạnh</p>
+              <strong>{{ osmGraph?.edgeCount ?? 0 }}</strong>
+            </div>
+            <div>
+              <p class="label">Ways</p>
+              <strong>{{ osmGraph?.wayCount ?? 0 }}</strong>
+            </div>
           </div>
         </div>
         <p class="hint">
-          Lưới ({{ gridRows }}×{{ gridCols }}) được tạo theo bounding box của hai điểm. Ta dùng
-          heuristic nhất quán nên A* luôn tìm ra đường tối ưu nếu tồn tại.
+          Graph gom đúng node/way của OSM nên đường tìm được bám sát thực tế và heuristic haversine giúp A* hội tụ nhanh.
         </p>
 
         <div v-if="error" class="state error">{{ error }}</div>
-        <div v-else-if="loading" class="state">Đang dựng lưới và chạy A*...</div>
+        <div v-else-if="loading" class="state">Đang dựng graph và chạy A*...</div>
         <template v-else>
           <div v-if="searchResult" class="summary">
             <div class="summary-grid">
@@ -1127,12 +968,16 @@ class MinHeap<T> {
                 <strong>{{ searchResult.generated }}</strong>
               </div>
               <div>
-                <p class="label">Kích thước lưới</p>
-                <strong>{{ searchResult.gridMeta.rows }} × {{ searchResult.gridMeta.cols }}</strong>
+                <p class="label">Nodes trong graph</p>
+                <strong>{{ searchResult.nodeCount }}</strong>
               </div>
               <div>
-                <p class="label">Tỉ lệ chướng ngại</p>
-                <strong>{{ (searchResult.blockedRatio * 100).toFixed(1) }}%</strong>
+                <p class="label">Cạnh trong graph</p>
+                <strong>{{ searchResult.edgeCount }}</strong>
+              </div>
+              <div>
+                <p class="label">Số ways</p>
+                <strong>{{ searchResult.wayCount }}</strong>
               </div>
             </div>
 
@@ -1145,7 +990,7 @@ class MinHeap<T> {
       </section>
     </main>
 
-    <footer>Demo chạy offline: dữ liệu chỉ gồm lưới giả lập nên kết quả khác bản đồ thực tế.</footer>
+    <footer>Demo chạy offline trên dữ liệu OSM cục bộ, chưa bao gồm đầy đủ thuộc tính giao thông.</footer>
   </div>
 </template>
 
@@ -1369,7 +1214,7 @@ class MinHeap<T> {
   gap: 16px;
 }
 
-.grid-density {
+.graph-density {
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 12px;
   padding: 16px;
@@ -1379,19 +1224,17 @@ class MinHeap<T> {
   background: rgba(15, 23, 42, 0.6);
 }
 
-.grid-density-control {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  font-weight: 600;
+.graph-density-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 12px;
 }
 
-.grid-density-slider {
-  flex: 1;
-  accent-color: #2563eb;
+.graph-density-stats strong {
+  font-size: 20px;
 }
 
-.grid-density-note {
+.graph-density-note {
   font-size: 13px;
   color: #94a3b8;
   margin: 4px 0 0;
